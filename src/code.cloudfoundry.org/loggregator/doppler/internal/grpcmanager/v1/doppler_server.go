@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"code.cloudfoundry.org/batching"
+	gendiodes "code.cloudfoundry.org/diodes"
 	"code.cloudfoundry.org/loggregator/diodes"
 	"code.cloudfoundry.org/loggregator/metricemitter"
 	"code.cloudfoundry.org/loggregator/plumbing"
@@ -148,7 +149,9 @@ func marshalEnvelopes(envelopes []*events.Envelope) [][]byte {
 }
 
 func (m *DopplerServer) sendData(req *plumbing.SubscriptionRequest, sender sender) error {
-	d := diodes.NewOneToOne(1000, m)
+	d := diodes.NewOneToOneWaiter(1000, m,
+		gendiodes.WithWaiterContext(sender.Context()),
+	)
 	cleanup := m.registrar.Register(req, d)
 	defer cleanup()
 
@@ -192,7 +195,9 @@ func (b *batchWriter) Write(batch [][]byte) {
 }
 
 func (m *DopplerServer) sendBatchData(req *plumbing.SubscriptionRequest, sender plumbing.Doppler_BatchSubscribeServer) error {
-	d := diodes.NewOneToOne(1000, m)
+	d := diodes.NewOneToOneWaiter(1000, m,
+		gendiodes.WithWaiterContext(sender.Context()),
+	)
 	cleanup := m.registrar.Register(req, d)
 	defer cleanup()
 
@@ -203,21 +208,39 @@ func (m *DopplerServer) sendBatchData(req *plumbing.SubscriptionRequest, sender 
 		&batchWriter{sender: sender, errStream: errStream},
 	)
 
+	c := make(chan []byte)
+	go func() {
+		for {
+			data := d.Next()
+			if data == nil {
+				return
+			}
+
+			select {
+			case c <- data:
+			case <-sender.Context().Done():
+				return
+			}
+		}
+	}()
+
+	resetDuration := 250 * time.Millisecond
+	timer := time.NewTimer(resetDuration)
 	for {
 		select {
 		case <-sender.Context().Done():
 			return sender.Context().Err()
 		case err := <-errStream:
 			return err
-		default:
-			data, ok := d.TryNext()
-			if !ok {
-				batcher.Flush()
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-
+		case <-timer.C:
+			batcher.ForcedFlush()
+			timer.Reset(resetDuration)
+		case data := <-c:
 			batcher.Write(data)
+			if !timer.Stop() {
+				<-timer.C
+			}
+			timer.Reset(resetDuration)
 		}
 	}
 }
