@@ -25,6 +25,7 @@ import (
 // MetricClient creates new CounterMetrics to be emitted periodically.
 type MetricClient interface {
 	NewCounter(name string, opts ...metricemitter.MetricOption) *metricemitter.Counter
+	NewGauge(name, unit string, opts ...metricemitter.MetricOption) *metricemitter.Gauge
 }
 
 // RLP represents the reverse log proxy component. It connects to various gRPC
@@ -63,7 +64,7 @@ func NewRLP(m MetricClient, opts ...RLPOption) *RLP {
 		ingressAddrs:         []string{"doppler.service.cf.internal"},
 		ingressDialOpts:      []grpc.DialOption{grpc.WithInsecure()},
 		egressServerOpts:     []grpc.ServerOption{},
-		maxEgressConnections: 500,
+		maxEgressConnections: 1000,
 		metricClient:         m,
 		healthAddr:           "localhost:33333",
 		ctx:                  ctx,
@@ -188,7 +189,7 @@ func (r *RLP) setupEgress() {
 	r.egressServer = grpc.NewServer(r.egressServerOpts...)
 	v2.RegisterEgressServer(
 		r.egressServer,
-		egress.NewServer(r.receiver, r.metricClient, r.health, r.ctx, 100, time.Second),
+		egress.NewServer(r.receiver, r.metricClient, r.health, r.ctx, 100, time.Second, 500),
 	)
 	v2.RegisterEgressQueryServer(r.egressServer, egress.NewQueryServer(r.querier))
 }

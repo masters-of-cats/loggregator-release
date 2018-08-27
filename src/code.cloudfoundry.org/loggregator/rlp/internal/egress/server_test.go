@@ -9,6 +9,8 @@ import (
 
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	v2 "code.cloudfoundry.org/loggregator/plumbing/v2"
 	"code.cloudfoundry.org/loggregator/rlp/internal/egress"
@@ -29,7 +31,7 @@ var _ = Describe("Server", func() {
 				},
 			}
 			receiverServer := &spyReceiverServer{}
-			receiver := newSpyReceiver(0)
+			receiver := newSpyReceiver(0, 0)
 			server := egress.NewServer(
 				receiver,
 				testhelper.NewMetricClient(),
@@ -37,6 +39,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.Receiver(req, receiverServer)
@@ -46,7 +49,7 @@ var _ = Describe("Server", func() {
 
 		It("errors when the sender cannot send the envelope", func() {
 			receiverServer := &spyReceiverServer{err: errors.New("Oh No!")}
-			receiver := newSpyReceiver(1)
+			receiver := newSpyReceiver(1, 0)
 			server := egress.NewServer(
 				receiver,
 				testhelper.NewMetricClient(),
@@ -54,6 +57,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.Receiver(&v2.EgressRequest{}, receiverServer)
@@ -63,7 +67,7 @@ var _ = Describe("Server", func() {
 
 		It("streams data when there are envelopes", func() {
 			receiverServer := &spyReceiverServer{}
-			receiver := newSpyReceiver(10)
+			receiver := newSpyReceiver(10, 0)
 			server := egress.NewServer(
 				receiver,
 				testhelper.NewMetricClient(),
@@ -71,6 +75,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.Receiver(&v2.EgressRequest{}, receiverServer)
@@ -81,7 +86,7 @@ var _ = Describe("Server", func() {
 
 		It("closes the receiver when the context is canceled", func() {
 			receiverServer := &spyReceiverServer{}
-			receiver := newSpyReceiver(1000000000)
+			receiver := newSpyReceiver(1000000000, 0)
 			ctx, cancel := context.WithCancel(context.TODO())
 			server := egress.NewServer(
 				receiver,
@@ -90,6 +95,7 @@ var _ = Describe("Server", func() {
 				ctx,
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			go func() {
@@ -108,7 +114,7 @@ var _ = Describe("Server", func() {
 			receiverServer := &spyReceiverServer{
 				err: errors.New("Oh no!"),
 			}
-			receiver := newSpyReceiver(100000000)
+			receiver := newSpyReceiver(100000000, 0)
 			server := egress.NewServer(
 				receiver,
 				testhelper.NewMetricClient(),
@@ -116,6 +122,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			go server.Receiver(&v2.EgressRequest{}, receiverServer)
@@ -125,11 +132,42 @@ var _ = Describe("Server", func() {
 			Eventually(ctx.Done()).Should(BeClosed())
 		})
 
+		It("rejects the stream when there are too many", func(done Done) {
+			defer close(done)
+
+			metricClient := testhelper.NewMetricClient()
+			receiverServer := &spyReceiverServer{}
+			receiver := newSpyReceiver(100000000, 10*time.Millisecond)
+			health := newSpyHealthRegistrar()
+
+			server := egress.NewServer(
+				receiver,
+				metricClient,
+				health,
+				context.TODO(),
+				1,
+				time.Nanosecond,
+				1,
+			)
+
+			go server.Receiver(&v2.EgressRequest{}, receiverServer)
+			Eventually(func() float64 {
+				return health.Get("subscriptionCount")
+			}).Should(Equal(1.0))
+
+			err := server.Receiver(&v2.EgressRequest{}, receiverServer)
+			st, ok := status.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(st.Code()).To(Equal(codes.ResourceExhausted))
+
+			Expect(metricClient.GetDelta("rejected_streams")).To(BeNumerically("==", 1))
+		}, 2)
+
 		Describe("Metrics", func() {
 			It("emits 'egress' metric for each envelope", func() {
 				metricClient := testhelper.NewMetricClient()
 				receiverServer := &spyReceiverServer{}
-				receiver := newSpyReceiver(10)
+				receiver := newSpyReceiver(10, 0)
 				server := egress.NewServer(
 					receiver,
 					metricClient,
@@ -137,6 +175,7 @@ var _ = Describe("Server", func() {
 					context.TODO(),
 					1,
 					time.Nanosecond,
+					500,
 				)
 
 				err := server.Receiver(&v2.EgressRequest{}, receiverServer)
@@ -147,14 +186,14 @@ var _ = Describe("Server", func() {
 				}).Should(BeNumerically("==", 10))
 			})
 
-			It("emits 'dropped' metric for each envelope", func() {
+			It("emits 'slow_consumers' metric for each disconnected slow consumer", func() {
 				metricClient := testhelper.NewMetricClient()
 				receiverServer := &spyReceiverServer{
 					wait: make(chan struct{}),
 				}
 				defer receiverServer.stopWait()
 
-				receiver := newSpyReceiver(1000000)
+				receiver := newSpyReceiver(1000000000, 0)
 				server := egress.NewServer(
 					receiver,
 					metricClient,
@@ -162,29 +201,32 @@ var _ = Describe("Server", func() {
 					context.TODO(),
 					1,
 					time.Nanosecond,
+					500,
 				)
 
 				go server.Receiver(&v2.EgressRequest{}, receiverServer)
 
 				Eventually(func() uint64 {
-					return metricClient.GetDelta("dropped")
-				}, 3).Should(BeNumerically(">", 100))
+					return metricClient.GetDelta("slow_consumers")
+				}, 3).Should(BeNumerically("==", 1))
 			})
 		})
 
 		Describe("health monitoring", func() {
 			It("increments and decrements subscription count", func() {
+				metricClient := testhelper.NewMetricClient()
 				receiverServer := &spyReceiverServer{}
-				receiver := newSpyReceiver(1000000000)
+				receiver := newSpyReceiver(10000000, 100*time.Millisecond)
 
 				health := newSpyHealthRegistrar()
 				server := egress.NewServer(
 					receiver,
-					testhelper.NewMetricClient(),
+					metricClient,
 					health,
 					context.TODO(),
 					1,
 					time.Nanosecond,
+					500,
 				)
 				go server.Receiver(&v2.EgressRequest{}, receiverServer)
 
@@ -192,11 +234,19 @@ var _ = Describe("Server", func() {
 					return health.Get("subscriptionCount")
 				}).Should(Equal(1.0))
 
+				Eventually(func() float64 {
+					return metricClient.GetValue("subscriptions")
+				}, 2).Should(Equal(1.0))
+
 				receiver.stop()
 
 				Eventually(func() float64 {
 					return health.Get("subscriptionCount")
 				}).Should(Equal(0.0))
+
+				Eventually(func() float64 {
+					return metricClient.GetValue("subscriptions")
+				}, 2).Should(Equal(0.0))
 			})
 		})
 	})
@@ -211,12 +261,13 @@ var _ = Describe("Server", func() {
 				},
 			}
 			server := egress.NewServer(
-				newSpyReceiver(0),
+				newSpyReceiver(0, 0),
 				testhelper.NewMetricClient(),
 				newSpyHealthRegistrar(),
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.BatchedReceiver(req, &spyBatchedReceiverServer{})
@@ -233,6 +284,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
@@ -243,12 +295,13 @@ var _ = Describe("Server", func() {
 		It("streams data when there are envelopes", func() {
 			receiverServer := &spyBatchedReceiverServer{}
 			server := egress.NewServer(
-				newSpyReceiver(10),
+				newSpyReceiver(10, 0),
 				testhelper.NewMetricClient(),
 				newSpyHealthRegistrar(),
 				context.TODO(),
 				10,
 				time.Nanosecond,
+				500,
 			)
 
 			err := server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
@@ -259,7 +312,7 @@ var _ = Describe("Server", func() {
 
 		It("closes the receiver when the context is canceled", func() {
 			receiverServer := &spyBatchedReceiverServer{}
-			receiver := newSpyReceiver(1000000000)
+			receiver := newSpyReceiver(1000000000, 0)
 
 			ctx, cancel := context.WithCancel(context.TODO())
 			server := egress.NewServer(
@@ -269,6 +322,7 @@ var _ = Describe("Server", func() {
 				ctx,
 				1,
 				time.Nanosecond,
+				500,
 			)
 
 			go func() {
@@ -287,7 +341,7 @@ var _ = Describe("Server", func() {
 			receiverServer := &spyBatchedReceiverServer{
 				err: errors.New("Oh no!"),
 			}
-			receiver := newSpyReceiver(100000000)
+			receiver := newSpyReceiver(100000000, 0)
 			server := egress.NewServer(
 				receiver,
 				testhelper.NewMetricClient(),
@@ -295,6 +349,7 @@ var _ = Describe("Server", func() {
 				context.TODO(),
 				1,
 				time.Nanosecond,
+				500,
 			)
 			go server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
 
@@ -303,10 +358,41 @@ var _ = Describe("Server", func() {
 			Eventually(ctx.Done()).Should(BeClosed())
 		})
 
+		It("rejects the stream when there are too many", func(done Done) {
+			defer close(done)
+
+			receiverServer := &spyBatchedReceiverServer{}
+			receiver := newSpyReceiver(100000000, 10*time.Millisecond)
+			health := newSpyHealthRegistrar()
+			metricClient := testhelper.NewMetricClient()
+
+			server := egress.NewServer(
+				receiver,
+				metricClient,
+				health,
+				context.TODO(),
+				1,
+				time.Nanosecond,
+				1,
+			)
+
+			go server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
+			Eventually(func() float64 {
+				return health.Get("subscriptionCount")
+			}).Should(Equal(1.0))
+
+			err := server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
+			st, ok := status.FromError(err)
+			Expect(ok).To(BeTrue())
+			Expect(st.Code()).To(Equal(codes.ResourceExhausted))
+
+			Expect(metricClient.GetDelta("rejected_streams")).To(BeNumerically("==", 1))
+		}, 2)
+
 		Describe("Metrics", func() {
 			It("emits 'egress' metric for each envelope", func() {
 				metricClient := testhelper.NewMetricClient()
-				receiver := newSpyReceiver(10)
+				receiver := newSpyReceiver(10, 0)
 				server := egress.NewServer(
 					receiver,
 					metricClient,
@@ -314,6 +400,7 @@ var _ = Describe("Server", func() {
 					context.TODO(),
 					10,
 					time.Second,
+					500,
 				)
 
 				err := server.BatchedReceiver(
@@ -327,10 +414,10 @@ var _ = Describe("Server", func() {
 				}).Should(BeNumerically("==", 10))
 			})
 
-			It("emits 'dropped' metric for each envelope", func() {
+			It("emits 'slow_consumers' metric for each disconnected slow consumer", func() {
 				metricClient := testhelper.NewMetricClient()
 				receiverServer := &spyBatchedReceiverServer{}
-				receiver := newSpyReceiver(1000000)
+				receiver := newSpyReceiver(1000000, 0)
 
 				server := egress.NewServer(
 					receiver,
@@ -339,26 +426,30 @@ var _ = Describe("Server", func() {
 					context.TODO(),
 					1,
 					time.Nanosecond,
+					500,
 				)
 				go server.BatchedReceiver(&v2.EgressBatchRequest{}, receiverServer)
 
 				Eventually(func() uint64 {
-					return metricClient.GetDelta("dropped")
-				}, 3).Should(BeNumerically(">", 100))
+					return metricClient.GetDelta("slow_consumers")
+				}, 3).Should(BeNumerically("==", 1))
 			})
 		})
 
 		Describe("health monitoring", func() {
 			It("increments and decrements subscription count", func() {
-				receiver := newSpyReceiver(1000000000)
+				receiver := newSpyReceiver(1000000, 10*time.Millisecond)
 				health := newSpyHealthRegistrar()
+				metricClient := testhelper.NewMetricClient()
+
 				server := egress.NewServer(
 					receiver,
-					testhelper.NewMetricClient(),
+					metricClient,
 					health,
 					context.TODO(),
 					1,
 					time.Nanosecond,
+					500,
 				)
 
 				go server.BatchedReceiver(
@@ -370,11 +461,19 @@ var _ = Describe("Server", func() {
 					return health.Get("subscriptionCount")
 				}).Should(Equal(1.0))
 
+				Eventually(func() float64 {
+					return metricClient.GetValue("subscriptions")
+				}, 2).Should(Equal(1.0))
+
 				receiver.stop()
 
 				Eventually(func() float64 {
 					return health.Get("subscriptionCount")
 				}).Should(Equal(0.0))
+
+				Eventually(func() float64 {
+					return metricClient.GetValue("subscriptions")
+				}, 2).Should(Equal(0.0))
 			})
 		})
 	})
@@ -433,17 +532,19 @@ func (s *spyBatchedReceiverServer) EnvelopeCount() int64 {
 type spyReceiver struct {
 	envelope       *v2.Envelope
 	envelopeRepeat int
+	wait           time.Duration
 
 	stopCh chan struct{}
 	ctx    chan context.Context
 }
 
-func newSpyReceiver(envelopeCount int) *spyReceiver {
+func newSpyReceiver(envelopeCount int, wait time.Duration) *spyReceiver {
 	return &spyReceiver{
 		envelope:       &v2.Envelope{},
 		envelopeRepeat: envelopeCount,
 		stopCh:         make(chan struct{}),
 		ctx:            make(chan context.Context, 1),
+		wait:           wait,
 	}
 }
 
@@ -457,6 +558,7 @@ func (s *spyReceiver) Receive(ctx context.Context, req *v2.EgressRequest) (func(
 				return nil, io.EOF
 			default:
 				s.envelopeRepeat--
+				time.Sleep(s.wait)
 				return s.envelope, nil
 			}
 		}

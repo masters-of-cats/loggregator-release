@@ -1,6 +1,8 @@
 package testhelper
 
 import (
+	"sync"
+
 	"code.cloudfoundry.org/loggregator/metricemitter"
 	v2 "code.cloudfoundry.org/loggregator/plumbing/v2"
 )
@@ -16,6 +18,7 @@ type gaugeMetric struct {
 }
 
 type SpyMetricClient struct {
+	mu             sync.Mutex
 	counterMetrics []counterMetric
 	gaugeMetrics   []gaugeMetric
 }
@@ -25,6 +28,9 @@ func NewMetricClient() *SpyMetricClient {
 }
 
 func (s *SpyMetricClient) NewCounter(name string, opts ...metricemitter.MetricOption) *metricemitter.Counter {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	m := metricemitter.NewCounter(name, "", opts...)
 
 	s.counterMetrics = append(s.counterMetrics, counterMetric{
@@ -36,6 +42,9 @@ func (s *SpyMetricClient) NewCounter(name string, opts ...metricemitter.MetricOp
 }
 
 func (s *SpyMetricClient) NewGauge(name, unit string, opts ...metricemitter.MetricOption) *metricemitter.Gauge {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	m := metricemitter.NewGauge(name, unit, "", opts...)
 
 	s.gaugeMetrics = append(s.gaugeMetrics, gaugeMetric{
@@ -47,6 +56,9 @@ func (s *SpyMetricClient) NewGauge(name, unit string, opts ...metricemitter.Metr
 }
 
 func (s *SpyMetricClient) GetDelta(name string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, m := range s.counterMetrics {
 		if m.metricName == name {
 			return m.metric.GetDelta()
@@ -57,6 +69,9 @@ func (s *SpyMetricClient) GetDelta(name string) uint64 {
 }
 
 func (s *SpyMetricClient) GetEnvelopes(name string) []*v2.Envelope {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	var envs []*v2.Envelope
 
 	for _, m := range s.counterMetrics {
@@ -87,6 +102,9 @@ func (s *SpyMetricClient) GetEnvelopes(name string) []*v2.Envelope {
 }
 
 func (s *SpyMetricClient) GetValue(name string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	for _, m := range s.gaugeMetrics {
 		if m.metricName == name {
 			return m.metric.GetValue()
