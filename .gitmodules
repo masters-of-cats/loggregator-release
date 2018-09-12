@@ -78,7 +78,7 @@
 	url = https://github.com/cloudfoundry/noaa.git
 [submodule "src/github.com/cloudfoundry/sonde-go"]
 	path = src/github.com/cloudfoundry/sonde-go
-	url = https://github.com/cloudfoundry/sonde-go
+	url = https://github.com/masters-of-cats/sonde-go
 [submodule "src/code.cloudfoundry.org/go-diodes"]
 	path = src/code.cloudfoundry.org/go-diodes
 	url = https://github.com/cloudfoundry/go-diodes
